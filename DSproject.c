@@ -8,8 +8,6 @@
 #include <fcntl.h>
 
 #define MAX_LINE 80
-#define TOTAL_POINTS 1000000 
-#define NUM_PROCESSES 4
 
 int main(void) {
     char *args[MAX_LINE/2 + 1];
@@ -21,12 +19,13 @@ int main(void) {
         printf("uinxsh> ");
         fflush(stdout);
 
+        // 1. Clean up zombie processes
         while (waitpid(-1, NULL, WNOHANG) > 0);
 
         if (fgets(input, MAX_LINE, stdin) == NULL) break;
         input[strcspn(input, "\n")] = '\0';
 
-
+        // 2. History Management (!!)
         if (strcmp(input, "!!") == 0) {
             if (strlen(last_command) == 0) {
                 printf("No commands in history.\n");
@@ -38,19 +37,18 @@ int main(void) {
             strcpy(last_command, input);
         }
 
-
+        // 3. Parsing input into arguments
         int i = 0;
         char *token = strtok(input, " ");
         while (token != NULL) {
-            args[i] = token;
-            i++;
+            args[i++] = token;
             token = strtok(NULL, " ");
         }
         args[i] = NULL;
 
         if (args[0] == NULL) continue;
 
-
+        // 4. Built-in Commands
         if (strcmp(args[0], "exit") == 0) {
             should_run = 0;
             continue;
@@ -58,33 +56,21 @@ int main(void) {
 
         if (strcmp(args[0], "pwd") == 0) {
             char cwd[1024];
-            if (getcwd(cwd, sizeof(cwd)) != NULL) {
-                printf("%s\n", cwd);
-            }
+            if (getcwd(cwd, sizeof(cwd)) != NULL) printf("%s\n", cwd);
             continue;
         }
 
         if (strcmp(args[0], "cd") == 0) {
-            if (args[1] == NULL) {
-                fprintf(stderr, "uinxsh: expected argument to \"cd\"\n");
-            } else {
-                if (chdir(args[1]) != 0) {
-                    perror("uinxsh");
-                }
+            if (args[1] != NULL) {
+                if (chdir(args[1]) != 0) perror("cd failed");
             }
             continue;
         }
 
         if (strcmp(args[0], "help") == 0) {
-            printf("\n--- UinxShell Help ---\n");
-            printf("Built-in commands available:\n");
-            printf("  cd <path>  : Change the current directory\n");
-            printf("  pwd        : Print current working directory\n");
-            printf("  clear      : Clear the terminal screen\n");
-            printf("  exit       : Terminate the shell\n");
-            printf("  help       : Display this information\n");
-            printf("  !!         : Run the last command again\n");
-            printf("External commands (like ls, mkdir, etc.) are also supported.\n\n");
+            printf("Supported commands: cd, pwd, exit, clear, help, !!\n");
+            printf("Parallel project: mont_carlo <procs> <points>\n");
+            printf("Pipe: command1 | command2\n");
             continue;
         }
 
@@ -93,34 +79,42 @@ int main(void) {
             continue;
         }
 
-        // Monte Carlo Pi 
-        if (strcmp(args[0], "estimate_pi") == 0) {
-            int *circle_count = mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE, 
-                                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-            *circle_count = 0;
-            int pts_per_proc = TOTAL_POINTS / NUM_PROCESSES;
+        // 5. Parallel Project: Monte Carlo Pi Estimation
+        if (strcmp(args[0], "mont_carlo") == 0) {
+            if (args[1] == NULL || args[2] == NULL) {
+                printf("Usage: mont_carlo <processes> <points>\n");
+                continue;
+            }
+            int n_procs = atoi(args[1]);
+            long t_pts = atol(args[2]);
+            
+            // Create shared memory for inter-process communication
+            long *global_count = mmap(NULL, sizeof(long), PROT_READ|PROT_WRITE, 
+                                     MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+            *global_count = 0;
 
-            for (int p = 0; p < NUM_PROCESSES; p++) {
+            for (int p = 0; p < n_procs; p++) {
                 if (fork() == 0) {
-                    srand(time(NULL) ^ (getpid() << 16));
-                    int local = 0;
-                    for (int j = 0; j < pts_per_proc; j++) {
-                        double x = (double)rand() / RAND_MAX;
-                        double y = (double)rand() / RAND_MAX;
+                    unsigned int seed = time(NULL) ^ (getpid() << 16);
+                    long local = 0;
+                    for (long j = 0; j < t_pts/n_procs; j++) {
+                        double x = (double)rand_r(&seed)/RAND_MAX*2.0-1.0;
+                        double y = (double)rand_r(&seed)/RAND_MAX*2.0-1.0;
                         if (x*x + y*y <= 1.0) local++;
                     }
-                    *circle_count += local;
+                    *global_count += local;
                     exit(0);
                 }
             }
-            for (int p = 0; p < NUM_PROCESSES; p++) wait(NULL);
+            for (int p = 0; p < n_procs; p++) wait(NULL);
             
-            double pi = 4.0 * (*circle_count) / TOTAL_POINTS;
-            printf("Pi Estimation using %d processes: %f\n", NUM_PROCESSES, pi);
-            munmap(circle_count, sizeof(int));
+            double pi_val = 4.0 * (*global_count) / t_pts;
+            printf("Estimated Pi with %d processes: %f\n", n_procs, pi_val);
+            munmap(global_count, sizeof(long));
             continue;
         }
 
+        // 6. Pipe Support (|)
         int pipe_pos = -1;
         for (int j = 0; args[j] != NULL; j++) {
             if (strcmp(args[j], "|") == 0) {
@@ -132,14 +126,15 @@ int main(void) {
 
         if (pipe_pos != -1) {
             int fd[2];
-            pipe(fd);
-            if (fork() == 0) {
+            if (pipe(fd) == -1) { perror("Pipe failed"); continue; }
+
+            if (fork() == 0) { // First child
                 dup2(fd[1], STDOUT_FILENO);
                 close(fd[0]); close(fd[1]);
                 execvp(args[0], args);
                 exit(1);
             }
-            if (fork() == 0) {
+            if (fork() == 0) { // Second child
                 dup2(fd[0], STDIN_FILENO);
                 close(fd[1]); close(fd[0]);
                 execvp(args[pipe_pos + 1], &args[pipe_pos + 1]);
@@ -150,13 +145,29 @@ int main(void) {
             continue;
         }
 
-
-        int run_in_background = 0;
+        // 7. Background Execution (&)
+        int bg = 0;
         if (i > 0 && args[i-1] != NULL && strcmp(args[i-1], "&") == 0) {
-            run_in_background = 1;
+            bg = 1;
             args[i-1] = NULL;
         }
 
+        // 8. External Command Execution
+        pid_t pid = fork();
+        if (pid == 0) {
+            if (execvp(args[0], args) == -1) {
+                printf("Command not found: %s\n", args[0]);
+                exit(1);
+            }
+        } else if (pid > 0) {
+            if (!bg) {
+                waitpid(pid, NULL, 0);
+            } else {
+                printf("[Background Process PID: %d]\n", pid);
+            }
+        } else {
+            perror("Fork failed");
+        }
     }
     return 0;
 }
