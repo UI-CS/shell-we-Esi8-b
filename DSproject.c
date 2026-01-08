@@ -6,8 +6,70 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <fcntl.h>
+#include <ctype.h>
 
 #define MAX_LINE 80
+#define THRESHOLD 20 
+
+/* Helper function to remove leading/trailing whitespace and hidden characters */
+void trim(char *str) {
+    char *end;
+    while(isspace((unsigned char)*str)) str++;
+    if(*str == 0) return;
+    end = str + strlen(str) - 1;
+    while(end > str && isspace((unsigned char)*end)) end--;
+    end[1] = '\0';
+}
+
+/* Merge function for the sorting algorithm */
+void merge(int *array, int low, int mid, int high) {
+    int n1 = mid - low + 1, n2 = high - mid;
+    int *left = malloc(n1 * sizeof(int));
+    int *right = malloc(n2 * sizeof(int));
+    
+    for (int i = 0; i < n1; i++) left[i] = array[low + i];
+    for (int i = 0; i < n2; i++) right[i] = array[mid + 1 + i];
+    
+    int i = 0, j = 0, k = low;
+    while (i < n1 && j < n2) array[k++] = (left[i] <= right[j]) ? left[i++] : right[j++];
+    while (i < n1) array[k++] = left[i++];
+    while (j < n2) array[k++] = right[j++];
+    
+    free(left); free(right);
+}
+
+/* Parallel Merge Sort implementation using Fork-Join and Shared Memory */
+void parallel_merge_sort(int *array, int low, int high) {
+    if (low < high) {
+        /* Criterion: Use sequential sort for small chunks to reduce overhead */
+        if (high - low + 1 <= THRESHOLD) {
+            for (int i = low; i <= high; i++) {
+                for (int j = i + 1; j <= high; j++) {
+                    if (array[i] > array[j]) {
+                        int temp = array[i]; array[i] = array[j]; array[j] = temp;
+                    }
+                }
+            }
+            return;
+        }
+
+        int mid = low + (high - low) / 2;
+        pid_t pid = fork();
+        
+        if (pid == 0) {
+            /* Child process handles the left half */
+            parallel_merge_sort(array, low, mid);
+            exit(0);
+        } else if (pid > 0) {
+            /* Parent process handles the right half */
+            parallel_merge_sort(array, mid + 1, high);
+            /* Join: Wait for child to complete */
+            waitpid(pid, NULL, 0); 
+            /* Combine halves */
+            merge(array, low, mid, high);
+        }
+    }
+}
 
 int main(void) {
     char *args[MAX_LINE/2 + 1];
@@ -19,13 +81,13 @@ int main(void) {
         printf("uinxsh> ");
         fflush(stdout);
 
-        // 1. Clean up zombie processes
+        /* Clean up zombie processes */
         while (waitpid(-1, NULL, WNOHANG) > 0);
 
         if (fgets(input, MAX_LINE, stdin) == NULL) break;
         input[strcspn(input, "\n")] = '\0';
 
-        // 2. History Management (!!)
+        /* History Management */
         if (strcmp(input, "!!") == 0) {
             if (strlen(last_command) == 0) {
                 printf("No commands in history.\n");
@@ -33,14 +95,15 @@ int main(void) {
             }
             strcpy(input, last_command);
             printf("%s\n", input);
-        } else {
+        } else if (strlen(input) > 0) {
             strcpy(last_command, input);
         }
 
-        // 3. Parsing input into arguments
+        /* Parsing input into arguments */
         int i = 0;
         char *token = strtok(input, " ");
         while (token != NULL) {
+            trim(token);
             args[i++] = token;
             token = strtok(NULL, " ");
         }
@@ -48,38 +111,33 @@ int main(void) {
 
         if (args[0] == NULL) continue;
 
-        // 4. Built-in Commands
+        /* Built-in Shell Commands */
         if (strcmp(args[0], "exit") == 0) {
             should_run = 0;
             continue;
         }
 
-        if (strcmp(args[0], "pwd") == 0) {
-            char cwd[1024];
-            if (getcwd(cwd, sizeof(cwd)) != NULL) printf("%s\n", cwd);
-            continue;
+        /* Parallel Project: Fork-Join Merge Sort */
+        if (strcmp(args[0], "fork_sort") == 0) {
+            int size = 40; 
+            int *shared_array = mmap(NULL, size * sizeof(int), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+            
+            srand(time(NULL));
+            printf("Generating numbers...\n");
+            for(int j=0; j<size; j++) shared_array[j] = rand() % 100;
+            
+            printf("Sorting in parallel...\n");
+            parallel_merge_sort(shared_array, 0, size - 1);
+            
+            printf("Sorted array: ");
+            for(int j=0; j<size; j++) printf("%d ", shared_array[j]);
+            printf("\n");
+            
+            munmap(shared_array, size * sizeof(int));
+            continue; 
         }
 
-        if (strcmp(args[0], "cd") == 0) {
-            if (args[1] != NULL) {
-                if (chdir(args[1]) != 0) perror("cd failed");
-            }
-            continue;
-        }
-
-        if (strcmp(args[0], "help") == 0) {
-            printf("Supported commands: cd, pwd, exit, clear, help, !!\n");
-            printf("Parallel project: mont_carlo <procs> <points>\n");
-            printf("Pipe: command1 | command2\n");
-            continue;
-        }
-
-        if (strcmp(args[0], "clear") == 0) {
-            printf("\033[H\033[J");
-            continue;
-        }
-
-        // 5. Parallel Project: Monte Carlo Pi Estimation
+        /* Parallel Project: Monte Carlo Pi Estimation */
         if (strcmp(args[0], "mont_carlo") == 0) {
             if (args[1] == NULL || args[2] == NULL) {
                 printf("Usage: mont_carlo <processes> <points>\n");
@@ -87,10 +145,7 @@ int main(void) {
             }
             int n_procs = atoi(args[1]);
             long t_pts = atol(args[2]);
-            
-            // Create shared memory for inter-process communication
-            long *global_count = mmap(NULL, sizeof(long), PROT_READ|PROT_WRITE, 
-                                     MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+            long *global_count = mmap(NULL, sizeof(long), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
             *global_count = 0;
 
             for (int p = 0; p < n_procs; p++) {
@@ -107,52 +162,24 @@ int main(void) {
                 }
             }
             for (int p = 0; p < n_procs; p++) wait(NULL);
-            
-            double pi_val = 4.0 * (*global_count) / t_pts;
-            printf("Estimated Pi with %d processes: %f\n", n_procs, pi_val);
+            printf("Estimated Pi: %f\n", 4.0 * (*global_count) / t_pts);
             munmap(global_count, sizeof(long));
-            continue;
+            continue; 
         }
 
-        // 6. Pipe Support (|)
-        int pipe_pos = -1;
-        for (int j = 0; args[j] != NULL; j++) {
-            if (strcmp(args[j], "|") == 0) {
-                pipe_pos = j;
-                args[j] = NULL;
-                break;
-            }
+        if (strcmp(args[0], "pwd") == 0) {
+            char cwd[1024]; getcwd(cwd, sizeof(cwd)); printf("%s\n", cwd); continue;
+        }
+        
+        if (strcmp(args[0], "cd") == 0) {
+            if (args[1]) chdir(args[1]); continue;
         }
 
-        if (pipe_pos != -1) {
-            int fd[2];
-            if (pipe(fd) == -1) { perror("Pipe failed"); continue; }
-
-            if (fork() == 0) { // First child
-                dup2(fd[1], STDOUT_FILENO);
-                close(fd[0]); close(fd[1]);
-                execvp(args[0], args);
-                exit(1);
-            }
-            if (fork() == 0) { // Second child
-                dup2(fd[0], STDIN_FILENO);
-                close(fd[1]); close(fd[0]);
-                execvp(args[pipe_pos + 1], &args[pipe_pos + 1]);
-                exit(1);
-            }
-            close(fd[0]); close(fd[1]);
-            wait(NULL); wait(NULL);
-            continue;
+        if (strcmp(args[0], "clear") == 0) {
+            printf("\033[H\033[J"); continue;
         }
 
-        // 7. Background Execution (&)
-        int bg = 0;
-        if (i > 0 && args[i-1] != NULL && strcmp(args[i-1], "&") == 0) {
-            bg = 1;
-            args[i-1] = NULL;
-        }
-
-        // 8. External Command Execution
+        /* External Command Execution */
         pid_t pid = fork();
         if (pid == 0) {
             if (execvp(args[0], args) == -1) {
@@ -160,13 +187,7 @@ int main(void) {
                 exit(1);
             }
         } else if (pid > 0) {
-            if (!bg) {
-                waitpid(pid, NULL, 0);
-            } else {
-                printf("[Background Process PID: %d]\n", pid);
-            }
-        } else {
-            perror("Fork failed");
+            waitpid(pid, NULL, 0);
         }
     }
     return 0;
